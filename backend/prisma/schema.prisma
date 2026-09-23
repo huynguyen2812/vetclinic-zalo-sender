@@ -428,6 +428,8 @@ model ZaloAccount {
   // 2026-06-21 (E1 quét group) — roster member quét ra + lịch sử lần quét per-nick.
   groupMembers                     GroupMember[]
   groupScans                       GroupScan[]
+  // 2026-09-23 — Customer Care Gateway sender v2: nick do Gateway quản lý (1 channel account ↔ 1 nick).
+  gatewayChannelAccount            GatewayChannelAccount?
 
   @@map("zalo_accounts")
 }
@@ -4047,4 +4049,123 @@ model MediaUsageEvent {
   @@index([mediaAssetId])
   @@index([orgId, createdAt])
   @@map("media_usage_events")
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Customer Care Gateway sender contract v2 (2026-09-23)
+// Sender nội bộ server-to-server. Xem docs/gateway-sender-v2.md.
+// Không lưu plaintext signing key / cookie / session token.
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Một Gateway client (một deployment Customer Care Gateway). Nick nó tạo thuộc orgId,
+/// owner là service user ownerUserId. signingKeyEnc = AES-256-GCM (GATEWAY_SENDER_ENC_KEY).
+model GatewaySenderClient {
+  id                    String    @id @default(uuid())
+  clientId              String    @unique @map("client_id")
+  orgId                 String    @map("org_id")
+  ownerUserId           String    @map("owner_user_id")
+  signingKeyEnc         String    @map("signing_key_enc")
+  keyVersion            Int       @default(1) @map("key_version")
+  previousSigningKeyEnc String?   @map("previous_signing_key_enc")
+  previousKeyExpiresAt  DateTime? @map("previous_key_expires_at")
+  healthCallbackUrl     String?   @map("health_callback_url")
+  revokedAt             DateTime? @map("revoked_at")
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  accounts GatewayChannelAccount[]
+  attempts GatewayDeliveryAttempt[]
+
+  @@map("gateway_sender_clients")
+}
+
+/// channelAccountId (UUID của Gateway) ↔ đúng 1 nick ZaloCRM. Một channelAccountId chỉ thuộc 1 client.
+model GatewayChannelAccount {
+  id               String    @id @default(uuid())
+  clientRef        String    @map("client_ref")
+  channelAccountId String    @unique @map("channel_account_id")
+  zaloAccountId    String?   @unique @map("zalo_account_id")
+  // PENDING_LOGIN | CONNECTING | CONNECTED | RELOGIN_REQUIRED | RESTRICTED | DISCONNECTED | REVOKED
+  status           String    @default("PENDING_LOGIN")
+  paused           Boolean   @default(false)
+  sessionVersion   Int       @default(0) @map("session_version")
+  capabilities     Json      @default("{}")
+  displayName      String?   @map("display_name")
+  phoneMasked      String?   @map("phone_masked")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+  revokedAt        DateTime? @map("revoked_at")
+
+  client       GatewaySenderClient      @relation(fields: [clientRef], references: [id], onDelete: Restrict)
+  zaloAccount  ZaloAccount?             @relation(fields: [zaloAccountId], references: [id], onDelete: SetNull)
+  logins       GatewayLoginAttempt[]
+  attempts     GatewayDeliveryAttempt[]
+  healthEvents GatewayHealthOutbox[]
+
+  @@index([clientRef])
+  @@map("gateway_channel_accounts")
+}
+
+/// Một phiên QR. loginId = id (ngẫu nhiên). SUPERSEDED được đọc ra là EXPIRED.
+model GatewayLoginAttempt {
+  id                       String   @id
+  accountRef               String   @map("account_ref")
+  // PENDING | SCANNED | CONNECTED | EXPIRED | FAILED | SUPERSEDED
+  status                   String   @default("PENDING")
+  failureCode              String?  @map("failure_code")
+  provisionalZaloAccountId String?  @map("provisional_zalo_account_id")
+  expectedZaloUid          String?  @map("expected_zalo_uid")
+  expiresAt                DateTime @map("expires_at")
+  createdAt                DateTime @default(now()) @map("created_at")
+  updatedAt                DateTime @updatedAt @map("updated_at")
+
+  account GatewayChannelAccount @relation(fields: [accountRef], references: [id], onDelete: Cascade)
+
+  @@index([accountRef, status])
+  @@map("gateway_login_attempts")
+}
+
+/// Sổ idempotency theo deliveryAttemptId (giữ >= 7 ngày).
+/// CLAIMED (đã nhận, chưa gọi Zalo) → NOT_SENT | SENDING (ghi bền TRƯỚC khi gọi Zalo) → SENT | UNKNOWN.
+model GatewayDeliveryAttempt {
+  id                String    @id @default(uuid())
+  clientRef         String    @map("client_ref")
+  accountRef        String    @map("account_ref")
+  deliveryAttemptId String    @map("delivery_attempt_id")
+  requestHash       String    @map("request_hash")
+  state             String    @default("CLAIMED")
+  outcomeCode       String?   @map("outcome_code")
+  providerMessageId String?   @map("provider_message_id")
+  sendCalls         Int       @default(0) @map("send_calls")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  sendingAt         DateTime? @map("sending_at")
+  completedAt       DateTime? @map("completed_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  client  GatewaySenderClient   @relation(fields: [clientRef], references: [id], onDelete: Restrict)
+  account GatewayChannelAccount @relation(fields: [accountRef], references: [id], onDelete: Restrict)
+
+  @@unique([clientRef, deliveryAttemptId])
+  @@index([createdAt])
+  @@map("gateway_delivery_attempts")
+}
+
+/// Outbox health callback sender → Gateway (idempotent theo accountRef + at).
+model GatewayHealthOutbox {
+  id            String    @id @default(uuid())
+  accountRef    String    @map("account_ref")
+  status        String
+  reason        String?
+  at            DateTime
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime  @default(now()) @map("next_attempt_at")
+  deliveredAt   DateTime? @map("delivered_at")
+  lastError     String?   @map("last_error")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  account GatewayChannelAccount @relation(fields: [accountRef], references: [id], onDelete: Cascade)
+
+  @@unique([accountRef, at])
+  @@index([deliveredAt, nextAttemptAt])
+  @@map("gateway_health_outbox")
 }

@@ -9,6 +9,7 @@
  * declarations don't expose named exports in ESM mode.
  */
 import { createRequire } from 'module';
+import { encodeZaloSession, decodeZaloSession } from '../../shared/zalo-session-codec.js';
 import type { Server } from 'socket.io';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../shared/database/prisma-client.js';
@@ -77,8 +78,22 @@ function defaultReason(status: ZaloStatus): StatusReason {
   }
 }
 
+/**
+ * 2026-09-23 — Gateway sender v2: sự kiện QR login theo TỪNG account (thay cho Socket.IO room)
+ * để sender nội bộ trả QR/trạng thái qua API server-to-server. Chỉ chứa dữ liệu an toàn:
+ * ảnh QR, tên hiển thị, zaloUid — không bao giờ có cookie/imei/userAgent.
+ */
+export type PoolLoginEvent =
+  | { type: 'qr'; image: string }
+  | { type: 'scanned'; displayName?: string }
+  | { type: 'expired' }
+  | { type: 'connected'; zaloUid: string }
+  | { type: 'failed'; code: 'DUPLICATE_ACCOUNT' | 'LOGIN_ERROR' };
+
 class ZaloAccountPool {
   private instances = new Map<string, ZaloInstance>();
+  // Gateway v2: hook sự kiện login theo accountId (tối đa 1 hook / account).
+  private loginHooks = new Map<string, (e: PoolLoginEvent) => void>();
   private io: Server | null = null;
   // Shared user-info cache passed into each listener context
   private userInfoCache = new Map<string, UserInfoCacheEntry>();
@@ -99,6 +114,18 @@ class ZaloAccountPool {
 
   setIO(io: Server): void {
     this.io = io;
+  }
+
+  /** Gateway v2: đăng ký/huỷ hook sự kiện login cho đúng 1 account. */
+  setLoginHook(accountId: string, hook: ((e: PoolLoginEvent) => void) | null): void {
+    if (hook) this.loginHooks.set(accountId, hook);
+    else this.loginHooks.delete(accountId);
+  }
+
+  private emitLoginHook(accountId: string, e: PoolLoginEvent): void {
+    const hook = this.loginHooks.get(accountId);
+    if (!hook) return;
+    try { hook(e); } catch (err) { logger.warn(`[zalo:${accountId}] login hook error:`, err); }
   }
 
   /** Accessor cho module ngoài (friend-sync-service, ...) cần emit socket
@@ -160,7 +187,7 @@ class ZaloAccountPool {
   }
 
   // Initiate QR-based login; emits QR events to frontend via Socket.IO
-  async loginQR(accountId: string, proxyUrl?: string | null): Promise<void> {
+  async loginQR(accountId: string, proxyUrl?: string | null, opts?: { maxQrRetry?: number }): Promise<void> {
     // Fix lifecycle 2026-06-10: nick kẹt qr_pending/connecting do logout bên ngoài hoặc
     // breaker chặn. User CHỦ ĐỘNG quét QR lại → phải dọn SẠCH mọi state cũ trước khi tạo
     // instance mới, nếu không QR mới không sinh / bị instance ma ghi đè.
@@ -197,7 +224,8 @@ class ZaloAccountPool {
     // retry() VÔ HẠN trên CÙNG phiên SDK → QR sinh lại mãi nhưng quét không ăn ("tạo QR mới
     // không có tác dụng"). Sau MAX_QR_RETRY lần hết hạn → DỪNG retry, emit qr-session-dead để
     // FE hiện nút "Quét lại" → tạo phiên FRESH (loginQR mới, epoch mới).
-    const MAX_QR_RETRY = 3;
+    // Gateway v2 truyền maxQrRetry=1: QR đã trả cho Gateway không được tự thay bằng QR khác.
+    const MAX_QR_RETRY = Math.max(1, opts?.maxQrRetry ?? 3);
     let qrExpiredCount = 0;
     // FIX #6 (2026-06-16): epoch guard. login lần 2 trên cùng nick tạo instance mới (epoch++);
     // callback của phiên CŨ vẫn sống tới khi QR cũ expire → nếu nó emit sẽ trộn QR/ghi đè state
@@ -211,6 +239,7 @@ class ZaloAccountPool {
           case 0: // QRCodeGenerated
             logger.info(`[zalo:${accountId}] loginQR — QR code generated, emitting to socket room`);
             this.io?.to(`account:${accountId}`).emit('zalo:qr', { accountId, qrImage: event.data.image });
+            this.emitLoginHook(accountId, { type: 'qr', image: event.data.image });
             break;
           case 1: // QRCodeExpired
             qrExpiredCount++;
@@ -218,6 +247,7 @@ class ZaloAccountPool {
               // Hết lượt tự sinh lại → dừng phiên, báo FE cần quét lại thủ công (fresh).
               logger.info(`[zalo:${accountId}] loginQR — QR hết hạn ${qrExpiredCount} lần, DỪNG retry (cần quét lại)`);
               this.io?.to(`account:${accountId}`).emit('zalo:qr-session-dead', { accountId });
+              this.emitLoginHook(accountId, { type: 'expired' });
               // KHÔNG gọi retry → phiên loginQR này kết thúc. teardown để giải phóng.
               this.teardownExisting(accountId);
               return;
@@ -226,6 +256,7 @@ class ZaloAccountPool {
             event.actions?.retry();
             break;
           case 2: // QRCodeScanned
+            this.emitLoginHook(accountId, { type: 'scanned', displayName: event.data.display_name });
             this.io?.to(`account:${accountId}`).emit('zalo:scanned', {
               accountId,
               displayName: event.data.display_name,
@@ -292,6 +323,7 @@ class ZaloAccountPool {
               ? `Nick này đang do ${ownerName} quản lý. Liên hệ chủ tổ chức để chuyển giao.`
               : 'Nick này đã tồn tại trong hệ thống. Dùng "Kết nối lại" trên nick cũ.',
           });
+          this.emitLoginHook(accountId, { type: 'failed', code: 'DUPLICATE_ACCOUNT' });
           await this.cleanupGhostAccount(accountId);
           return; // dừng luồng login — không attach listener cho record đã xoá
         }
@@ -299,6 +331,7 @@ class ZaloAccountPool {
       }
 
       this.attachListener(accountId, api);
+      this.emitLoginHook(accountId, { type: 'connected', zaloUid: ownId });
       void this.emitAccountEventToOrg(accountId, 'zalo:connected', { accountId, zaloUid: ownId });
       // Emit webhook (orgId lookup is async, fire-and-forget)
       prisma.zaloAccount.findUnique({ where: { id: accountId }, select: { orgId: true } })
@@ -321,6 +354,7 @@ class ZaloAccountPool {
     } catch (err) {
       const instance = this.instances.get(accountId);
       if (instance) instance.status = 'disconnected';
+      this.emitLoginHook(accountId, { type: 'failed', code: 'LOGIN_ERROR' });
       void this.emitAccountEventToOrg(accountId, 'zalo:error', { accountId, error: String(err) });
       throw err;
     }
@@ -549,7 +583,7 @@ class ZaloAccountPool {
   private saveCredentials(accountId: string, credentials: ZaloCredentials): void {
     // 2026-06-11: system-context — pool ghi nền (không tenant ctx), tránh RLS chặn.
     runSystemQuery(() => prisma.zaloAccount
-      .update({ where: { id: accountId }, data: { sessionData: credentials as any } }))
+      .update({ where: { id: accountId }, data: { sessionData: encodeZaloSession(credentials) as any } }))
       .catch((err) => logger.error(`[zalo:${accountId}] saveCredentials error:`, err));
   }
 
@@ -609,8 +643,11 @@ class ZaloAccountPool {
       // ngừng auto-reconnect; KHÔNG xoá record (giữ data bạn bè/hội thoại gắn vào — admin
       // gộp sau). Fire-and-forget, bọc runSystemQuery (chạy nền không tenant ctx).
       if (status === 'connected' && zaloUid !== null) {
-        void runSystemQuery(() =>
-          prisma.zaloAccount.updateMany({
+        // 2026-09-23 (Gateway v2 isolation): lấy ĐÚNG danh sách ghost rồi chỉ ngắt các id đó.
+        // Trước đây vòng ngắt lọc MỌI instance qr_pending trong pool (mọi org/owner) → một nick
+        // connect làm chết phiên QR đang chờ của account khác. Nick do Gateway quản lý bị loại trừ.
+        void runSystemQuery(async () => {
+          const ghosts = await prisma.zaloAccount.findMany({
             where: {
               orgId: updated.orgId,
               ownerUserId: updated.ownerUserId,
@@ -618,19 +655,22 @@ class ZaloAccountPool {
               zaloUid: null,
               status: 'qr_pending',
               archivedAt: null,
+              gatewayChannelAccount: { is: null },
             },
+            select: { id: true },
+          });
+          const ids = ghosts.map((g) => g.id);
+          if (ids.length === 0) return { count: 0, ids };
+          const r = await prisma.zaloAccount.updateMany({
+            where: { id: { in: ids } },
             data: { status: 'disconnected', sessionData: Prisma.JsonNull },
-          }),
-        ).then((r) => {
-          if (r.count > 0) {
-            logger.info(`[zalo:${accountId}] ngắt ${r.count} ghost qr_pending cùng owner (chống tranh chấp session nick trùng)`);
-            // Ngắt khỏi pool nếu ghost đang chạy listener (đá nhau live). Thu thập id
-            // TRƯỚC rồi disconnect (disconnect xoá khỏi this.instances → tránh sửa Map
-            // đang lặp).
-            const ghostIds = [...this.instances]
-              .filter(([id, inst]) => id !== accountId && inst.status === 'qr_pending')
-              .map(([id]) => id);
-            for (const id of ghostIds) {
+          });
+          return { count: r.count, ids };
+        }).then(({ count, ids }) => {
+          if (count > 0) {
+            logger.info(`[zalo:${accountId}] ngắt ${count} ghost qr_pending cùng owner (chống tranh chấp session nick trùng)`);
+            for (const id of ids) {
+              if (this.instances.get(id)?.status !== 'qr_pending') continue;
               try { this.disconnect(id); } catch { /* best-effort */ }
             }
           }
@@ -753,7 +793,7 @@ class ZaloAccountPool {
         logger.info(`[zalo:${accountId}] autoReconnect skipped — sale đã NGẮT THỦ CÔNG (manual)`);
         return;
       }
-      const session = account?.sessionData as ZaloCredentials | null;
+      const session = decodeZaloSession(account?.sessionData);
       if (session?.imei) {
         logger.info(`[zalo:${accountId}] Auto-reconnecting...`);
         await this.reconnect(accountId, session, account?.proxyUrl);

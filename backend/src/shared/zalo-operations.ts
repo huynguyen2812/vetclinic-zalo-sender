@@ -11,6 +11,7 @@
  *   6. Return result or throw typed error
  */
 import type { Server } from 'socket.io';
+import { decodeZaloSession } from './zalo-session-codec.js';
 import { zaloPool } from '../modules/zalo/zalo-pool.js';
 import { zaloRateLimiter } from '../modules/zalo/zalo-rate-limiter.js';
 import { logger } from './utils/logger.js';
@@ -74,7 +75,7 @@ async function attemptReconnect(accountId: string): Promise<void> {
       where: { id: accountId },
       select: { sessionData: true },
     });
-    const session = account?.sessionData as ZaloCredentials | null;
+    const session = decodeZaloSession(account?.sessionData);
     if (!session?.imei) {
       throw new ZaloOpError('No saved session for reconnect', 'SESSION_EXPIRED', 401);
     }

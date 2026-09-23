@@ -6,6 +6,7 @@
  * Credentials contain sensitive cookies — access restricted to account admins.
  */
 import type { FastifyInstance } from 'fastify';
+import { decodeZaloSession, encodeZaloSession, type ZaloSessionCredentials } from '../../shared/zalo-session-codec.js';
 import { authMiddleware } from '../auth/auth-middleware.js';
 import { prisma } from '../../shared/database/prisma-client.js';
 import { logger } from '../../shared/utils/logger.js';
@@ -39,7 +40,7 @@ export async function credentialRoutes(app: FastifyInstance) {
 
     const account = await prisma.zaloAccount.findFirst({
       where: { id: accountId, orgId: user.orgId },
-      select: { id: true, sessionData: true, displayName: true },
+      select: { id: true, sessionData: true, displayName: true, gatewayChannelAccount: { select: { id: true } } },
     });
     if (!account) {
       return reply.status(404).send({ error: 'Account not found' });
@@ -55,6 +56,11 @@ export async function credentialRoutes(app: FastifyInstance) {
       }
     }
 
+    // Gateway sender v2: phiên của nick do Gateway quản lý KHÔNG bao giờ được xuất ra trình duyệt.
+    if (account.gatewayChannelAccount) {
+      return reply.status(403).send({ error: 'Credentials of gateway-managed accounts cannot be exported' });
+    }
+
     if (!account.sessionData) {
       return reply.status(404).send({ error: 'No credentials saved for this account' });
     }
@@ -63,7 +69,7 @@ export async function credentialRoutes(app: FastifyInstance) {
     reply.header('Content-Type', 'application/json');
     reply.header('Content-Disposition', `attachment; filename="${filename}"`);
     logger.info(`[credential-routes] Exporting credentials for account ${accountId}`);
-    return reply.send(JSON.stringify(account.sessionData, null, 2));
+    return reply.send(JSON.stringify(decodeZaloSession(account.sessionData), null, 2));
   });
 
   // POST .../credentials/import — restore credentials from uploaded JSON
@@ -100,7 +106,7 @@ export async function credentialRoutes(app: FastifyInstance) {
       await prisma.zaloAccount.update({
         where: { id: accountId },
         data: {
-          sessionData: body as any,
+          sessionData: encodeZaloSession(body as ZaloSessionCredentials) as any,
           status: 'disconnected',
         },
       });

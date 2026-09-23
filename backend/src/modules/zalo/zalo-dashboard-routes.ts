@@ -13,6 +13,7 @@
  * proxy, not a strict connection uptime. A future ZaloAccountStatusLog table can replace this.
  */
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import { decodeZaloSession } from '../../shared/zalo-session-codec.js';
 import { authMiddleware } from '../auth/auth-middleware.js';
 import { requireGrant } from '../rbac/rbac-middleware.js';
 import { prisma, tenantTransaction } from '../../shared/database/prisma-client.js';
@@ -491,7 +492,7 @@ export async function zaloDashboardRoutes(app: FastifyInstance): Promise<void> {
       for (const a of accounts) {
         try {
           if (action === 'reconnect') {
-            const session = a.sessionData as { cookie: any; imei: string; userAgent: string } | null;
+            const session = decodeZaloSession(a.sessionData);
             if (!session?.imei) {
               results.push({ id: a.id, ok: false, error: 'no saved session' });
               continue;

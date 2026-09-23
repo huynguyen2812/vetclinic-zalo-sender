@@ -49,3 +49,9 @@ secrets/
 # Telegram
 public-key-telegram
 public-key-telegram-product
+# 2026-09-24 — artefact local của pilot Gateway sender: KHÔNG commit (ảnh media pilot, env local frontend,
+# compose pilot có mật khẩu DB local ghi cứng, script gửi thử chứa số điện thoại thật).
+/.pilot-files/
+/frontend/.env.local
+/docker-compose.gateway-pilot.yml
+/backend/scripts/pilot-authorized-send.ts

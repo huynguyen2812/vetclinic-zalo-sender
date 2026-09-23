@@ -15,3 +15,7 @@ backend/static
 .vscode
 # Docs & local tooling not needed at runtime
 .claude
+
+# 2026-09-24 — script gửi thử của pilot chứa số điện thoại thật: không đưa vào image.
+backend/scripts/pilot-authorized-send.ts
+.pilot-files

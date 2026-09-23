@@ -78,6 +78,8 @@ import { notificationRoutes } from './modules/notifications/notification-routes.
 import { searchRoutes } from './modules/search/search-routes.js';
 import { startZaloHealthCheck } from './modules/zalo/zalo-health-check.js';
 import { publicApiRoutes } from './modules/api/public-api-routes.js';
+import { gatewaySenderRoutes } from './modules/api/gateway-sender-routes.js';
+import { decodeZaloSession } from './shared/zalo-session-codec.js';
 import { webhookSettingsRoutes } from './modules/api/webhook-settings-routes.js';
 import { startContactIntelligence } from './modules/contacts/contact-intelligence.js';
 import { analyticsRoutes } from './modules/analytics/analytics-routes.js';
@@ -318,6 +320,7 @@ async function bootstrap() {
   // Lead Pool + Facebook Lead Ads routes → registered by extension bundle.
   await app.register(searchRoutes);
   await app.register(publicApiRoutes);
+  await app.register(gatewaySenderRoutes);
   await app.register(webhookSettingsRoutes);
   await app.register(analyticsRoutes);
   await app.register(savedReportRoutes);
@@ -486,6 +489,24 @@ async function bootstrap() {
     process.exit(1);
   }
 
+  // Customer Care Gateway sender v2: phiên QR bỏ dở lúc tắt máy → EXPIRED + dọn nick tạm;
+  // dọn sổ idempotency > 7 ngày mỗi ngày; health callback chỉ chạy khi bật rõ ràng (Gateway chưa có endpoint).
+  try {
+    const { GatewayV2Service } = await import('./modules/gateway-v2/gateway-v2-service.js');
+    const { poolSessionProvider } = await import('./modules/gateway-v2/pool-session-provider.js');
+    const gatewayV2 = new GatewayV2Service(poolSessionProvider);
+    const expired = await gatewayV2.recoverOnBoot();
+    if (expired) logger.info('[gateway-v2] recovered ' + expired + ' open QR login(s) as EXPIRED');
+    const cron = (await import('node-cron')).default;
+    cron.schedule('30 3 * * *', () => { void gatewayV2.purgeIdempotency(Number(process.env.GATEWAY_IDEMPOTENCY_RETENTION_DAYS || 7)).catch(() => undefined); });
+    if (process.env.GATEWAY_HEALTH_CALLBACK_ENABLED === 'true') {
+      const { dispatchHealthOutbox } = await import('./modules/gateway-v2/gateway-v2-health.js');
+      setInterval(() => { void dispatchHealthOutbox().catch(() => undefined); }, 30_000).unref();
+    }
+  } catch (err) {
+    logger.error('[gateway-v2] boot maintenance failed:', err);
+  }
+
   // Reconnect Zalo accounts that have saved sessions
   try {
     // FIX 2 nick-ghost (2026-06-13): boot reconnect chỉ kéo nick THẬT (zaloUid != null)
@@ -497,11 +518,7 @@ async function bootstrap() {
     });
     logger.info(`Attempting reconnect for ${accounts.length} Zalo account(s)`);
     for (const account of accounts) {
-      const session = account.sessionData as {
-        cookie: any;
-        imei: string;
-        userAgent: string;
-      } | null;
+      const session = decodeZaloSession(account.sessionData);
       if (session?.imei) {
         zaloPool.reconnect(account.id, session).catch((err) => {
           logger.warn(`Auto-reconnect failed for account ${account.id}:`, err);
