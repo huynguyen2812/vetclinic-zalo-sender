@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .env
+.env.gateway-production
 *.log
 backups/
 .DS_Store
