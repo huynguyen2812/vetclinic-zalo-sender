@@ -5,6 +5,7 @@
  * PostgreSQL QA riêng, Redis QA riêng. Phiên Zalo là FAKE (không tài khoản/QR/tin Zalo thật).
  *
  * Chạy: GATEWAY_V2_QA=1 DATABASE_URL=<QA> REDIS_URL=<QA redis> npx vitest run tests/gateway-v2.integration.test.ts
+ * Bản PC (không Redis): GATEWAY_V2_QA=1 GATEWAY_V2_NONCE_STORE=pg DATABASE_URL=<QA> npx vitest run tests/gateway-v2.integration.test.ts
  * Không có GATEWAY_V2_QA=1 → bỏ qua (bộ test unit thường không cần DB).
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
@@ -115,7 +116,9 @@ describe.skipIf(!QA)('Gateway sender v2 (HTTP thật + Postgres/Redis QA, Zalo g
   beforeAll(async () => {
     ({ prisma } = await import('../src/shared/database/prisma-client.js'));
     ({ signV2 } = await import('../src/modules/gateway-v2/gateway-v2-auth.js'));
-    const { redisNonceStore } = await import('../src/modules/gateway-v2/gateway-v2-auth.js');
+    // GATEWAY_V2_NONCE_STORE=pg: chạy cùng bộ test với replay store PostgreSQL (bản PC, không Redis).
+    const { redisNonceStore: redisStore } = await import('../src/modules/gateway-v2/gateway-v2-auth.js');
+    const redisNonceStore = process.env.GATEWAY_V2_NONCE_STORE === 'pg' ? (await import('../src/modules/gateway-v2/pg-nonce-store.js')).pgNonceStore : redisStore;
     const { encodeZaloSession } = await import('../src/shared/zalo-session-codec.js');
     const { registerClient, registerAccount } = await import('../src/modules/gateway-v2/gateway-v2-registry.js');
     const { GatewayV2Service } = await import('../src/modules/gateway-v2/gateway-v2-service.js');

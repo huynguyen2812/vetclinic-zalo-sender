@@ -4169,3 +4169,15 @@ model GatewayHealthOutbox {
   @@index([deliveredAt, nextAttemptAt])
   @@map("gateway_health_outbox")
 }
+
+/// Chống phát lại (replay) cho request contract v2 khi chạy không có Redis (bản PC, chế độ chỉ-sender).
+/// Một dòng mỗi (client, nonce); dọn định kỳ khi đã hết hạn.
+model GatewayV2Nonce {
+  clientId  String   @map("client_id")
+  nonce     String
+  expiresAt DateTime @map("expires_at")
+
+  @@id([clientId, nonce])
+  @@index([expiresAt])
+  @@map("gateway_v2_nonces")
+}
